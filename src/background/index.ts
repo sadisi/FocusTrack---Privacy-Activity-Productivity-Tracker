@@ -28,20 +28,28 @@ if (typeof chrome !== 'undefined') {
   chrome.tabs?.onActivated?.addListener(async (activeInfo) => {
     try {
       const tab = await chrome.tabs.get(activeInfo.tabId);
-      await engine.onTabChanged(tab.id || null, tab.url || null);
+      if (tab && tab.url) {
+        await engine.onTabChanged(tab.id || null, tab.url);
+      } else {
+        await engine.checkCurrentActiveTab();
+      }
     } catch (e) {
-      await engine.onTabChanged(null, null);
+      await engine.checkCurrentActiveTab();
     }
   });
 
   // Tab URL update
   chrome.tabs?.onUpdated?.addListener(async (tabId, changeInfo, tab) => {
     if (changeInfo.status === 'complete' || changeInfo.url) {
-      const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      if (activeTab && activeTab.id === tabId) {
-        await engine.onTabChanged(tabId, tab.url || null);
+      if (tab && tab.active && tab.url) {
+        await engine.onTabChanged(tabId, tab.url);
       }
     }
+  });
+
+  // Tab removal event
+  chrome.tabs?.onRemoved?.addListener(async () => {
+    await engine.checkCurrentActiveTab();
   });
 
   // Window focus change

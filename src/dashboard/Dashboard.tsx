@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { StorageService, getTodayKey } from '../services/storage';
-import { DailyActivity, UserSettings, DomainActivity, Goal } from '../types';
+import { DailyActivity, UserSettings, DomainActivity, Goal, CurrentTrackingState } from '../types';
 import { ALL_CATEGORIES } from '../utils/categories';
 import { formatTime, formatTimeLive, calculateProductivityBreakdown } from '../analytics/productivity';
 import { evaluateGoals } from '../analytics/goals';
@@ -170,6 +170,17 @@ const Icon = {
       <path strokeLinecap="round" d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
     </svg>
   ),
+  Fire: ({ className }: { className?: string }) => (
+    <svg className={className} viewBox="0 0 24 24" fill="currentColor">
+      <path d="M12 23c-4.97 0-9-3.58-9-8 0-3.08 1.84-6.31 4.5-8.5.34-.28.84-.13.97.29.58 1.9 1.8 3.32 3.03 4.21.36.26.86-.03.82-.47-.28-3.05 1.15-6.19 3.65-8.03.38-.28.9.03.86.5-.27 3.05 1.34 5.34 2.87 6.84.34.33.92.09.91-.38-.05-2.22 1.05-3.95 2.1-4.96.34-.33.91-.07.89.4-.13 3.65 1.4 6.13 3.4 8.1.35.34.28.92-.15 1.17A8.99 8.99 0 0112 23z" />
+    </svg>
+  ),
+  SlashCircle: ({ className }: { className?: string }) => (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <circle cx="12" cy="12" r="9" />
+      <path strokeLinecap="round" d="M5.636 5.636l12.728 12.728" />
+    </svg>
+  ),
 };
 
 // ── Toggle Switch Component ────────────────────────────────────────────────────
@@ -194,6 +205,7 @@ type FilterCategory = 'all' | string;
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
 export const Dashboard: React.FC = () => {
+  const [currentState, setCurrentState] = useState<CurrentTrackingState | null>(null);
   const [activePage, setActivePage] = useState<ActivePage>('overview');
   const [activities, setActivities] = useState<Record<string, DailyActivity>>({});
   const [settings, setSettings] = useState<UserSettings | null>(null);
@@ -211,19 +223,33 @@ export const Dashboard: React.FC = () => {
 
   // ── Data Loading ──────────────────────────────────────────────────────────
   const loadData = useCallback(async () => {
+    let currState: CurrentTrackingState | null = null;
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
       try {
-        await new Promise<void>((resolve) => {
-          chrome.runtime.sendMessage({ type: 'GET_CURRENT_STATE' }, () => resolve());
+        const res = await new Promise<any>((resolve) => {
+          chrome.runtime.sendMessage({ type: 'GET_CURRENT_STATE' }, (response) => {
+            if (chrome.runtime.lastError || !response || response.error) {
+              resolve(null);
+            } else {
+              resolve(response);
+            }
+          });
         });
+        if (res && res.state) {
+          currState = res.state;
+        }
       } catch (e) {
         // ignore
       }
     }
+    if (!currState) currState = await StorageService.getCurrentState();
+
     const [acts, sets] = await Promise.all([
       StorageService.getActivities(),
       StorageService.getSettings(),
     ]);
+
+    setCurrentState(currState);
     setActivities(acts);
     setSettings(sets);
     setLoading(false);
@@ -231,7 +257,7 @@ export const Dashboard: React.FC = () => {
 
   useEffect(() => {
     loadData();
-    const interval = setInterval(loadData, 3000);
+    const interval = setInterval(loadData, 2000);
     return () => clearInterval(interval);
   }, [loadData]);
 
@@ -251,20 +277,79 @@ export const Dashboard: React.FC = () => {
   const todayKey = getTodayKey();
   const todayActivity = activities[todayKey] || { date: todayKey, totalTime: 0, domains: {}, sessions: [] };
 
+  // Compute live session seconds for active tracking domain
+  const liveSessionSeconds = useMemo(() => {
+    if (currentState && currentState.startTime && !currentState.isPaused && !currentState.isIdle && currentState.isWindowFocused && currentState.activeDomain) {
+      return Math.max(0, Math.floor((Date.now() - currentState.startTime) / 1000));
+    }
+    return 0;
+  }, [currentState, liveSeconds]);
+
+  const liveTotalTime = todayActivity.totalTime + (currentState?.activeDomain ? liveSessionSeconds : 0);
+
+  const streakDays = useMemo(() => {
+    let count = 0;
+    for (let i = 0; i < 365; i++) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      const key = getTodayKey(d);
+      if (activities[key] && activities[key].totalTime > 0) {
+        count++;
+      } else if (i > 0) {
+        break;
+      }
+    }
+    return count;
+  }, [activities]);
+
+  // Derived activities object with live-updated today stats for charts
+  const activitiesWithLive = useMemo(() => {
+    const copy = { ...activities };
+    const todayAct = copy[todayKey] || { date: todayKey, totalTime: 0, domains: {}, sessions: [] };
+    const updatedDomains = { ...(todayAct.domains || {}) };
+    if (currentState?.activeDomain) {
+      const activeDom = currentState.activeDomain;
+      const domData = updatedDomains[activeDom] || {
+        domain: activeDom,
+        category: 'Uncategorized',
+        totalTime: 0,
+        visitCount: 1,
+        lastActive: Date.now(),
+        firstVisit: Date.now(),
+      };
+      updatedDomains[activeDom] = {
+        ...domData,
+        totalTime: domData.totalTime + liveSessionSeconds,
+      };
+    }
+    copy[todayKey] = {
+      ...todayAct,
+      totalTime: liveTotalTime,
+      domains: updatedDomains,
+    };
+    return copy;
+  }, [activities, todayKey, currentState, liveSessionSeconds, liveTotalTime]);
+
   const yesterdayKey = useMemo(() => {
     const d = new Date(); d.setDate(d.getDate() - 1);
     return getTodayKey(d);
   }, []);
 
   const breakdown = useMemo(() =>
-    settings ? calculateProductivityBreakdown(todayActivity, settings) : null,
-    [todayActivity, settings, liveSeconds]
+    settings ? calculateProductivityBreakdown({
+      ...todayActivity,
+      totalTime: liveTotalTime
+    }, settings) : null,
+    [todayActivity, liveTotalTime, settings]
   );
 
   const topDomains = useMemo(() => {
     const domains = Object.values(todayActivity.domains || {});
-    return domains.sort((a, b) => b.totalTime - a.totalTime);
-  }, [todayActivity, liveSeconds]);
+    return domains.sort((a, b) => {
+      const aTime = a.domain === currentState?.activeDomain ? a.totalTime + liveSessionSeconds : a.totalTime;
+      const bTime = b.domain === currentState?.activeDomain ? b.totalTime + liveSessionSeconds : b.totalTime;
+      return bTime - aTime;
+    });
+  }, [todayActivity, currentState, liveSessionSeconds]);
 
   const filteredDomains = useMemo(() => {
     let list = Object.values(todayActivity.domains || {});
@@ -525,11 +610,17 @@ export const Dashboard: React.FC = () => {
             </p>
           </div>
           <div className="flex items-center gap-2">
-            {todayActivity.totalTime > 0 && (
+            {liveTotalTime > 0 && (
               <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 text-xs">
                 <Icon.Clock className="w-3.5 h-3.5 text-slate-500" />
-                <span className="text-slate-300 font-semibold tabular-nums">{formatTime(todayActivity.totalTime)}</span>
+                <span className="text-slate-300 font-semibold tabular-nums">{formatTime(liveTotalTime)}</span>
                 <span className="text-slate-600">today</span>
+              </div>
+            )}
+            {streakDays > 0 && (
+              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-amber-500/10 to-orange-500/10 border border-amber-500/25 text-amber-400 text-xs font-semibold shadow-sm">
+                <Icon.Fire className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
+                <span>{streakDays} day streak</span>
               </div>
             )}
           </div>
@@ -541,6 +632,42 @@ export const Dashboard: React.FC = () => {
           {/* ─── OVERVIEW PAGE ─── */}
           {activePage === 'overview' && (
             <div className="space-y-6 max-w-5xl mx-auto animate-fade-in-up">
+              {/* ── Now Tracking Banner ── */}
+              {currentState?.activeDomain && (
+                <div className="p-4 rounded-2xl bg-gradient-to-r from-slate-900 via-cyan-950/30 to-slate-900 border border-cyan-500/30 flex items-center justify-between shadow-xl shadow-cyan-500/5 relative overflow-hidden">
+                  <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/10 rounded-full blur-2xl pointer-events-none" />
+                  <div className="flex items-center gap-3.5">
+                    <div className="relative">
+                      <img
+                        src={getFaviconUrl(currentState.activeDomain)}
+                        alt={currentState.activeDomain}
+                        className="w-10 h-10 rounded-xl bg-slate-800 p-1 shadow-md"
+                        onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }}
+                      />
+                      <div className="absolute -top-1 -right-1 w-3.5 h-3.5 bg-emerald-400 rounded-full border-2 border-slate-950 animate-pulse" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-semibold uppercase tracking-wider text-cyan-400">Now Active</span>
+                        <span className="text-[10px] text-slate-500 font-mono">Live Counter</span>
+                      </div>
+                      <h4 className="text-base font-bold text-white leading-tight">
+                        {formatDomainDisplayName(currentState.activeDomain)}
+                      </h4>
+                      <p className="text-xs text-slate-400 font-mono">{currentState.activeDomain}</p>
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-2xl font-black text-cyan-400 font-mono tracking-tight tabular-nums">
+                      {formatTimeLive(
+                        (todayActivity.domains[currentState.activeDomain]?.totalTime || 0) + liveSessionSeconds
+                      )}
+                    </div>
+                    <div className="text-xs text-slate-400 font-medium">spent on site today</div>
+                  </div>
+                </div>
+              )}
+
               {/* Top Stats */}
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                 {/* Total Time */}
@@ -551,7 +678,7 @@ export const Dashboard: React.FC = () => {
                       <Icon.Clock className="w-4 h-4 text-cyan-400" />
                     </div>
                   </div>
-                  <div className="text-2xl font-bold text-white tabular-nums">{formatTime(todayActivity.totalTime)}</div>
+                  <div className="text-2xl font-bold text-white tabular-nums">{formatTime(liveTotalTime)}</div>
                   <div className="text-xs text-slate-500">{siteCount} site{siteCount !== 1 ? 's' : ''} · {sessionCount} session{sessionCount !== 1 ? 's' : ''}</div>
                 </div>
 
@@ -624,13 +751,16 @@ export const Dashboard: React.FC = () => {
                   ) : (
                     <div className="divide-y divide-slate-800/40">
                       {topDomains.slice(0, 7).map((d, i) => {
-                        const pct = todayActivity.totalTime > 0
-                          ? Math.round((d.totalTime / todayActivity.totalTime) * 100)
+                        const dTime = d.domain === currentState?.activeDomain
+                          ? d.totalTime + liveSessionSeconds
+                          : d.totalTime;
+                        const pct = liveTotalTime > 0
+                          ? Math.round((dTime / liveTotalTime) * 100)
                           : 0;
+                        const isHighTime = dTime >= 3600; // >1h warning
                         return (
-                          <button
+                          <div
                             key={d.domain}
-                            onClick={() => setSelectedDomain(d.domain)}
                             className="w-full flex items-center gap-3 px-5 py-3 hover:bg-slate-800/40 transition-colors text-left group"
                           >
                             <span className="text-xs text-slate-600 w-5 text-center font-medium">{i + 1}</span>
@@ -640,28 +770,46 @@ export const Dashboard: React.FC = () => {
                               className="w-6 h-6 rounded-md flex-shrink-0"
                               onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }}
                             />
-                            <div className="flex-1 min-w-0">
+                            <div className="flex-1 min-w-0 cursor-pointer" onClick={() => setSelectedDomain(d.domain)}>
                               <div className="flex items-center gap-2 mb-1">
                                 <span className="text-sm font-medium text-white truncate group-hover:text-cyan-400 transition-colors">
                                   {formatDomainDisplayName(d.domain)}
                                 </span>
                                 <CategoryBadge category={d.category} size="sm" />
+                                {isHighTime && (
+                                  <span className="px-1.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/20 text-[9px] text-amber-400 font-medium">
+                                    &gt;1h spent
+                                  </span>
+                                )}
                               </div>
                               <div className="flex items-center gap-2">
-                                <div className="flex-1 h-1 bg-slate-800 rounded-full overflow-hidden">
+                                <div className="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
                                   <div
-                                    className="h-full bg-gradient-to-r from-cyan-600 to-cyan-400 rounded-full transition-all duration-700"
-                                    style={{ width: `${pct}%` }}
+                                    className={`h-full rounded-full transition-all duration-700 ${
+                                      d.domain === currentState?.activeDomain
+                                        ? 'bg-gradient-to-r from-cyan-500 to-emerald-400 animate-pulse'
+                                        : 'bg-gradient-to-r from-cyan-600 to-cyan-400'
+                                    }`}
+                                    style={{ width: `${Math.max(pct, 2)}%` }}
                                   />
                                 </div>
-                                <span className="text-[10px] text-slate-600 flex-shrink-0">{d.visitCount}v</span>
+                                <span className="text-[10px] text-slate-600 flex-shrink-0">{d.visitCount} visits</span>
                               </div>
                             </div>
-                            <div className="text-right flex-shrink-0">
-                              <div className="text-sm font-semibold text-white tabular-nums">{formatTime(d.totalTime)}</div>
+                            <div className="text-right flex-shrink-0 cursor-pointer" onClick={() => setSelectedDomain(d.domain)}>
+                              <div className="text-sm font-semibold text-white tabular-nums">{formatTime(dTime)}</div>
                               <div className="text-[10px] text-slate-500">{pct}%</div>
                             </div>
-                          </button>
+                            <a
+                              href={`https://${d.domain}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              title={`Open ${d.domain}`}
+                              className="p-1 rounded-lg text-slate-600 hover:text-cyan-400 hover:bg-slate-800 transition-colors flex-shrink-0"
+                            >
+                              <Icon.ChevronRight className="w-4 h-4" />
+                            </a>
+                          </div>
                         );
                       })}
                     </div>
@@ -672,7 +820,7 @@ export const Dashboard: React.FC = () => {
                 <div className="lg:col-span-2 space-y-4">
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5">
                     <h3 className="text-sm font-semibold text-white mb-4">Category Distribution</h3>
-                    <CategoryDonutChart activity={todayActivity} settings={settings} />
+                    <CategoryDonutChart activity={activitiesWithLive[todayKey] || todayActivity} settings={settings} />
                   </div>
 
                   {breakdown && (
@@ -765,14 +913,14 @@ export const Dashboard: React.FC = () => {
                   <Icon.BarChart className="w-4 h-4 text-slate-400" />
                   Daily Browser Activity
                 </h3>
-                <ActivityChart activities={activities} days={analyticsRange} />
+                <ActivityChart activities={activitiesWithLive} days={analyticsRange} />
               </div>
 
               {/* Category Donut + Top Domains Period */}
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5">
                   <h3 className="text-sm font-semibold text-white mb-4">Category Distribution — Today</h3>
-                  <CategoryDonutChart activity={todayActivity} settings={settings} />
+                  <CategoryDonutChart activity={activitiesWithLive[todayKey] || todayActivity} settings={settings} />
                 </div>
 
                 {/* Top Domains Period */}
@@ -1014,13 +1162,23 @@ export const Dashboard: React.FC = () => {
                             });
                             setSettings(updated);
                           }}
-                          className={`flex-1 py-2.5 rounded-xl text-xs font-semibold border transition-all ${
+                          className={`flex-1 py-2.5 rounded-xl text-xs font-semibold border transition-all flex items-center justify-center gap-1.5 ${
                             settings.focusMode.mode === m
                               ? 'bg-cyan-500/15 border-cyan-500/40 text-cyan-400 shadow-sm'
                               : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
                           }`}
                         >
-                          {m === 'warning' ? '⚠️ Warning' : '🚫 Block'}
+                          {m === 'warning' ? (
+                            <>
+                              <Icon.Alert className="w-3.5 h-3.5 text-amber-400" />
+                              <span>Warning</span>
+                            </>
+                          ) : (
+                            <>
+                              <Icon.SlashCircle className="w-3.5 h-3.5 text-rose-400" />
+                              <span>Block</span>
+                            </>
+                          )}
                         </button>
                       ))}
                     </div>

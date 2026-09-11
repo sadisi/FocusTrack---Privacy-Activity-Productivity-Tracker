@@ -65,16 +65,14 @@ export const CategoryDonutChart: React.FC<CategoryChartProps> = ({ activity, set
   const cy = 68;
   const strokeWidth = 20;
   const circumference = 2 * Math.PI * radius;
-  // Start from the top (-90 deg = -(circumference * 0.25))
-  const startOffset = circumference * 0.25;
 
-  // Build segments with correct offsets
-  let runningDash = 0;
+  // Build segments with exact cumulative offset
+  let accum = 0;
   const segments = slices.map((slice) => {
     const dash = (slice.percentage / 100) * circumference;
-    const dashOffset = circumference - runningDash + startOffset;
-    runningDash += dash;
-    return { ...slice, dash, dashOffset };
+    const offset = -accum;
+    accum += dash;
+    return { ...slice, dash, offset };
   });
 
   const hoveredSlice = hoveredCat ? slices.find((s) => s.category === hoveredCat) : null;
@@ -83,7 +81,7 @@ export const CategoryDonutChart: React.FC<CategoryChartProps> = ({ activity, set
     <div className="flex items-center gap-4">
       {/* SVG Donut */}
       <div className="flex-shrink-0 relative">
-        <svg width="136" height="136" viewBox="0 0 136 136">
+        <svg width="136" height="136" viewBox="0 0 136 136" className="-rotate-90">
           {/* Background track */}
           <circle
             cx={cx} cy={cy} r={radius}
@@ -97,43 +95,44 @@ export const CategoryDonutChart: React.FC<CategoryChartProps> = ({ activity, set
               cx={cx} cy={cy} r={radius}
               fill="none"
               stroke={seg.color}
-              strokeWidth={hoveredCat === seg.category ? strokeWidth + 3 : strokeWidth - 2}
+              strokeWidth={hoveredCat === seg.category ? strokeWidth + 4 : strokeWidth - 2}
               strokeDasharray={`${seg.dash} ${circumference - seg.dash}`}
-              strokeDashoffset={seg.dashOffset}
+              strokeDashoffset={seg.offset}
               strokeLinecap="butt"
               style={{
-                transition: 'stroke-width 0.15s ease, stroke-dasharray 0.5s ease',
+                transition: 'all 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
                 cursor: 'pointer',
-                filter: hoveredCat === seg.category ? `drop-shadow(0 0 6px ${seg.color}80)` : 'none',
+                filter: hoveredCat === seg.category ? `drop-shadow(0 0 8px ${seg.color})` : 'none',
               }}
               onMouseEnter={() => setHoveredCat(seg.category)}
               onMouseLeave={() => setHoveredCat(null)}
             />
           ))}
-          {/* Center display */}
+        </svg>
+
+        {/* Center overlay (unrotated) */}
+        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none text-center">
           {hoveredSlice ? (
             <>
-              <text x={cx} y={cy - 8} textAnchor="middle" fontSize="11" fontWeight="700" fill={hoveredSlice.color}>
+              <span className="text-xs font-black" style={{ color: hoveredSlice.color }}>
                 {Math.round(hoveredSlice.percentage)}%
-              </text>
-              <text x={cx} y={cy + 6} textAnchor="middle" fontSize="8" fill="#94a3b8">
+              </span>
+              <span className="text-[10px] font-semibold text-slate-300 leading-tight">
                 {hoveredSlice.category.split(' ')[0]}
-              </text>
-              <text x={cx} y={cy + 18} textAnchor="middle" fontSize="8" fill="#64748b">
+              </span>
+              <span className="text-[9px] text-slate-400 font-mono">
                 {formatTimeCompact(hoveredSlice.seconds)}
-              </text>
+              </span>
             </>
           ) : (
             <>
-              <text x={cx} y={cy - 4} textAnchor="middle" fontSize="13" fontWeight="700" fill="white">
+              <span className="text-sm font-bold text-white font-mono leading-tight">
                 {formatTimeCompact(totalSeconds)}
-              </text>
-              <text x={cx} y={cy + 11} textAnchor="middle" fontSize="9" fill="#64748b">
-                total today
-              </text>
+              </span>
+              <span className="text-[9px] text-slate-500 font-medium">total today</span>
             </>
           )}
-        </svg>
+        </div>
       </div>
 
       {/* Legend */}

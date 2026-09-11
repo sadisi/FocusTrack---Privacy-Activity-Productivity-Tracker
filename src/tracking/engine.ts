@@ -41,7 +41,17 @@ export class TrackingEngine {
       chrome.idle.setDetectionInterval(settings.idleThresholdSeconds || 60);
     }
 
-    // Identify active tab on init
+    // Restore previous state from storage if Service Worker restarted
+    const savedState = await StorageService.getCurrentState();
+    if (savedState && savedState.activeDomain && savedState.startTime && !this.isPaused) {
+      this.currentDomain = savedState.activeDomain;
+      this.currentTabId = savedState.activeTabId ?? null;
+      this.startTime = savedState.startTime;
+      this.isWindowFocused = savedState.isWindowFocused ?? true;
+      this.isIdle = savedState.isIdle ?? false;
+    }
+
+    // Identify current active tab and flush any pending time
     await this.checkCurrentActiveTab();
   }
 
@@ -86,7 +96,7 @@ export class TrackingEngine {
     } else if (!canTrack) {
       // Don't wipe startTime entirely — only null it if the reason is idle/unfocused/paused
       // It will be restored when tracking resumes via onTabChanged / onIdleStateChanged
-      if (this.startTime !== null && !this.isWindowFocused || this.isIdle || this.isPaused) {
+      if (this.startTime !== null && (!this.isWindowFocused || this.isIdle || this.isPaused)) {
         this.startTime = null;
       }
     }
@@ -163,8 +173,8 @@ export class TrackingEngine {
 
     try {
       const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      if (activeTab && activeTab.url) {
-        await this.onTabChanged(activeTab.id || null, activeTab.url);
+      if (activeTab) {
+        await this.onTabChanged(activeTab.id || null, activeTab.url || null);
       } else {
         await this.onTabChanged(null, null);
       }
@@ -178,22 +188,37 @@ export class TrackingEngine {
    */
   public async onTabChanged(tabId: number | null, url: string | null): Promise<void> {
     const newDomain = extractDomain(url);
-
-    // Dedup guard: skip if same tab+domain to avoid double-counting on onUpdated events
     const updateKey = `${tabId}:${newDomain}`;
-    if (updateKey === this.lastTabUpdateKey) return;
+
+    // Dedup guard: if exact same tabId + domain and state is active, skip redundant events
+    if (updateKey === this.lastTabUpdateKey && this.currentDomain === newDomain && this.currentTabId === tabId) {
+      // If tracking was stopped (startTime === null) and we returned to a valid web domain, resume it!
+      if (newDomain && this.startTime === null && this.isWindowFocused && !this.isIdle && !this.isPaused) {
+        this.startTime = Date.now();
+        await StorageService.saveCurrentState({
+          activeDomain: this.currentDomain,
+          activeTabId: this.currentTabId,
+          startTime: this.startTime,
+          isWindowFocused: this.isWindowFocused,
+          isIdle: this.isIdle,
+          isPaused: this.isPaused,
+        });
+      }
+      return;
+    }
     this.lastTabUpdateKey = updateKey;
 
     if (this.currentDomain !== newDomain || this.currentTabId !== tabId) {
-      // Flush previous domain time before switching
+      // Flush previous domain session time before changing tab or domain
       await this.flushCurrentSession();
 
+      const isDomainChanged = this.currentDomain !== newDomain;
       this.currentTabId = tabId;
       this.currentDomain = newDomain;
-      this.startTime = newDomain ? Date.now() : null;
+      this.startTime = (newDomain && this.isWindowFocused && !this.isIdle && !this.isPaused) ? Date.now() : null;
 
-      // Increment visit count when navigating to a new domain
-      if (newDomain) {
+      // Increment visit count only if navigating to a new web domain
+      if (newDomain && isDomainChanged) {
         await this.incrementVisitCount(newDomain);
       }
 
@@ -249,7 +274,18 @@ export class TrackingEngine {
     await this.flushCurrentSession();
 
     if (typeof chrome !== 'undefined' && chrome.windows) {
-      this.isWindowFocused = windowId !== chrome.windows.WINDOW_ID_NONE;
+      if (windowId === chrome.windows.WINDOW_ID_NONE) {
+        // Verify if any browser window is actually focused before setting unfocused
+        try {
+          const windows = await chrome.windows.getAll({ populate: false });
+          const hasFocused = windows.some((w) => w.focused);
+          this.isWindowFocused = hasFocused;
+        } catch (e) {
+          this.isWindowFocused = false;
+        }
+      } else {
+        this.isWindowFocused = true;
+      }
     } else {
       this.isWindowFocused = windowId > 0;
     }
